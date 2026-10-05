@@ -60,8 +60,53 @@ def evaluate_ragas(questions: list[str], answers: list[str],
     # except Exception as e:
     #     print(f"  ⚠️  RAGAS evaluation failed: {e}")
     #     return zeros
-    return {"faithfulness": 0.0, "answer_relevancy": 0.0,
-            "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
+    zeros = {"faithfulness": 0.0, "answer_relevancy": 0.0,
+             "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
+    if not questions:
+        return zeros
+    try:
+        from ragas import evaluate
+        from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+        from datasets import Dataset
+
+        dataset = Dataset.from_dict({
+            "question": questions, "answer": answers,
+            "contexts": contexts, "ground_truth": ground_truths,
+        })
+        from ragas.run_config import RunConfig
+
+        # Giới hạn retry/timeout để key sai hoặc mất mạng fail nhanh thay vì treo.
+        result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
+                                            context_precision, context_recall],
+                          run_config=RunConfig(timeout=60, max_retries=2, max_wait=10))
+        df = result.to_pandas()
+
+        def _score(row, name: str) -> float:
+            v = row.get(name, 0.0)
+            return 0.0 if v is None or v != v else float(v)  # NaN → 0.0
+
+        per_question = [
+            EvalResult(
+                question=row["question"], answer=row["answer"],
+                contexts=list(row["contexts"]), ground_truth=row["ground_truth"],
+                faithfulness=_score(row, "faithfulness"),
+                answer_relevancy=_score(row, "answer_relevancy"),
+                context_precision=_score(row, "context_precision"),
+                context_recall=_score(row, "context_recall"),
+            )
+            for _, row in df.iterrows()
+        ]
+        n = max(len(per_question), 1)
+        return {
+            "faithfulness": sum(r.faithfulness for r in per_question) / n,
+            "answer_relevancy": sum(r.answer_relevancy for r in per_question) / n,
+            "context_precision": sum(r.context_precision for r in per_question) / n,
+            "context_recall": sum(r.context_recall for r in per_question) / n,
+            "per_question": per_question,
+        }
+    except Exception as e:
+        print(f"  ⚠️  RAGAS evaluation failed: {e}")
+        return zeros
 
 
 def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list[dict]:
@@ -77,7 +122,33 @@ def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list
     # 3. Sort by avg ascending → take bottom_n
     # 4. Return [{"question": ..., "worst_metric": ..., "score": ...,
     #             "diagnosis": ..., "suggested_fix": ...}]
-    return []
+    diagnostic_tree = {
+        "faithfulness": ("LLM hallucinating", "Tighten prompt, lower temperature"),
+        "context_recall": ("Missing relevant chunks", "Improve chunking or add BM25"),
+        "context_precision": ("Too many irrelevant chunks", "Add reranking or metadata filter"),
+        "answer_relevancy": ("Answer doesn't match question", "Improve prompt template"),
+    }
+
+    scored = []
+    for r in eval_results:
+        metrics = {m: getattr(r, m) for m in diagnostic_tree}
+        avg = sum(metrics.values()) / len(metrics)
+        worst_metric = min(metrics, key=metrics.get)
+        scored.append((avg, worst_metric, metrics[worst_metric], r))
+
+    scored.sort(key=lambda x: x[0])
+    failures = []
+    for avg, worst_metric, score, r in scored[:bottom_n]:
+        diagnosis, fix = diagnostic_tree[worst_metric]
+        failures.append({
+            "question": r.question,
+            "worst_metric": worst_metric,
+            "score": round(score, 4),
+            "avg_score": round(avg, 4),
+            "diagnosis": diagnosis,
+            "suggested_fix": fix,
+        })
+    return failures
 
 
 def save_report(results: dict, failures: list[dict], path: str = "reports/ragas_report.json"):
