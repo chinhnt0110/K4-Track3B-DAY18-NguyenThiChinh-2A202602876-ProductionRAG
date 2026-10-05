@@ -34,68 +34,72 @@ def load_test_set(path: str = TEST_SET_PATH) -> list[dict]:
 def evaluate_ragas(questions: list[str], answers: list[str],
                    contexts: list[list[str]], ground_truths: list[str]) -> dict:
     """Run RAGAS evaluation."""
-    # TODO: Implement RAGAS evaluation
-    # 1. Wrap trong try/except — RAGAS cần OPENAI_API_KEY và Python 3.11+.
-    # try:
-    #     from ragas import evaluate
-    #     from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
-    #     from datasets import Dataset
-    #
-    #     dataset = Dataset.from_dict({
-    #         "question": questions, "answer": answers,
-    #         "contexts": contexts, "ground_truth": ground_truths,
-    #     })
-    #     result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
-    #                                         context_precision, context_recall])
-    #     df = result.to_pandas()
-    #     per_question = [EvalResult(question=row["question"], answer=row["answer"],
-    #         contexts=row["contexts"], ground_truth=row["ground_truth"],
-    #         faithfulness=float(row.get("faithfulness", 0.0)),
-    #         answer_relevancy=float(row.get("answer_relevancy", 0.0)),
-    #         context_precision=float(row.get("context_precision", 0.0)),
-    #         context_recall=float(row.get("context_recall", 0.0)))
-    #         for _, row in df.iterrows()]
-    #     return {"faithfulness": ..., "answer_relevancy": ...,
-    #             "context_precision": ..., "context_recall": ..., "per_question": [...]}
-    # except Exception as e:
-    #     print(f"  ⚠️  RAGAS evaluation failed: {e}")
-    #     return zeros
+
     zeros = {"faithfulness": 0.0, "answer_relevancy": 0.0,
              "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
     if not questions:
         return zeros
     try:
-        from ragas import evaluate
+        import asyncio
+        from config import OPENAI_API_KEY
         from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
-        from datasets import Dataset
-
-        dataset = Dataset.from_dict({
-            "question": questions, "answer": answers,
-            "contexts": contexts, "ground_truth": ground_truths,
-        })
         from ragas.run_config import RunConfig
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-        # Giới hạn retry/timeout để key sai hoặc mất mạng fail nhanh thay vì treo.
-        result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
-                                            context_precision, context_recall],
-                          run_config=RunConfig(timeout=60, max_retries=2, max_wait=10))
-        df = result.to_pandas()
+        eval_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, request_timeout=30, max_retries=1, api_key=OPENAI_API_KEY)
+        eval_embeddings = OpenAIEmbeddings(model="text-embedding-3-small", request_timeout=30, api_key=OPENAI_API_KEY)
+        wrapped_llm = LangchainLLMWrapper(eval_llm)
+        wrapped_embeddings = LangchainEmbeddingsWrapper(eval_embeddings)
 
-        def _score(row, name: str) -> float:
-            v = row.get(name, 0.0)
-            return 0.0 if v is None or v != v else float(v)  # NaN → 0.0
+        metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+        for m in metrics:
+            m.llm = wrapped_llm
+            if hasattr(m, "embeddings"):
+                m.embeddings = wrapped_embeddings
+            m.init(RunConfig())
 
-        per_question = [
-            EvalResult(
-                question=row["question"], answer=row["answer"],
-                contexts=list(row["contexts"]), ground_truth=row["ground_truth"],
-                faithfulness=_score(row, "faithfulness"),
-                answer_relevancy=_score(row, "answer_relevancy"),
-                context_precision=_score(row, "context_precision"),
-                context_recall=_score(row, "context_recall"),
+        async def _eval_one(q, a, ctx, gt, idx, total):
+            row = {"question": q, "answer": a, "contexts": ctx, "ground_truth": gt}
+            f, cp, cr, ar = await asyncio.gather(
+                faithfulness.ascore(row),
+                context_precision.ascore(row),
+                context_recall.ascore(row),
+                answer_relevancy.ascore(row),
+                return_exceptions=True
             )
-            for _, row in df.iterrows()
-        ]
+            def _clean(val):
+                return 0.0 if isinstance(val, Exception) or val != val else float(val)
+
+            f_score = _clean(f)
+            cp_score = _clean(cp)
+            cr_score = _clean(cr)
+            ar_score = _clean(ar)
+            print(f"  [{idx+1}/{total}] Faith: {f_score:.2f} | C-Prec: {cp_score:.2f} | C-Rec: {cr_score:.2f} | Relev: {ar_score:.2f}", flush=True)
+
+            return EvalResult(
+                question=q, answer=a, contexts=list(ctx), ground_truth=gt,
+                faithfulness=f_score,
+                answer_relevancy=ar_score,
+                context_precision=cp_score,
+                context_recall=cr_score,
+            )
+
+        async def _eval_all():
+            tasks = [
+                _eval_one(q, a, ctx, gt, i, len(questions))
+                for i, (q, a, ctx, gt) in enumerate(zip(questions, answers, contexts, ground_truths))
+            ]
+            # Chạy song song từng đợt 4 câu để vừa nhanh vừa không quá tải API
+            sem = asyncio.Semaphore(4)
+            async def _throttled(coro):
+                async with sem:
+                    return await coro
+            return await asyncio.gather(*[_throttled(t) for t in tasks])
+
+        per_question = asyncio.run(_eval_all())
+
         n = max(len(per_question), 1)
         return {
             "faithfulness": sum(r.faithfulness for r in per_question) / n,
@@ -111,17 +115,6 @@ def evaluate_ragas(questions: list[str], answers: list[str],
 
 def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list[dict]:
     """Analyze bottom-N worst questions using Diagnostic Tree."""
-    # TODO: Implement failure analysis
-    # 1. diagnostic_tree = {
-    #        "faithfulness": ("LLM hallucinating", "Tighten prompt, lower temperature"),
-    #        "context_recall": ("Missing relevant chunks", "Improve chunking or add BM25"),
-    #        "context_precision": ("Too many irrelevant chunks", "Add reranking or metadata filter"),
-    #        "answer_relevancy": ("Answer doesn't match question", "Improve prompt template"),
-    #    }
-    # 2. For each EvalResult: compute avg of 4 metrics, find worst_metric
-    # 3. Sort by avg ascending → take bottom_n
-    # 4. Return [{"question": ..., "worst_metric": ..., "score": ...,
-    #             "diagnosis": ..., "suggested_fix": ...}]
     diagnostic_tree = {
         "faithfulness": ("LLM hallucinating", "Tighten prompt, lower temperature"),
         "context_recall": ("Missing relevant chunks", "Improve chunking or add BM25"),
